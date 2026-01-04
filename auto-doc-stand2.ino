@@ -1,8 +1,11 @@
 /*
   Motorized Photo Stand Controller
   Board: Elegoo MEGA 2560 R3
-  Driver: TMC2209 (UART + StallGuard)
+  Driver: TMC2209 (UART + StallGuard) - BIGTREETECH
   Display: SSD1306 I2C 128x64
+  
+  UART: Hardware Serial3 (TX3=Pin 14, RX3=Pin 15)
+  Connect TMC2209 PDN_UART to Pin 14
 */
 
 #include <AccelStepper.h>
@@ -21,6 +24,7 @@
 #define STEP_PIN        46
 #define DIR_PIN         48
 #define ENABLE_PIN      44
+// TMC2209 UART now uses Hardware Serial3: TX3=Pin 14, RX3=Pin 15
 
 #define DIAG_PIN        19   // INT4
 #define ESTOP_BUTTON     2   // INT0
@@ -30,6 +34,9 @@
 const uint8_t presetPins[5] = {5, 6, 7, 8, 9};
 
 #define JOYSTICK_Y      A0
+
+/* ===================== TMC UART (Hardware Serial3) ===================== */
+#define TMC_SERIAL Serial3  // TX3=Pin 14, RX3=Pin 15
 
 /* ===================== OLED ===================== */
 #define SCREEN_WIDTH 128
@@ -41,12 +48,8 @@ AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 /* ===================== TMC2209 ===================== */
 #define R_SENSE 0.11f
-#define DRIVER_ADDRESS 0b00
-TMC2209Stepper driver(&Serial1, R_SENSE, DRIVER_ADDRESS);
-
-//Can also try 0b10 or 0b11
-//TMC2209Stepper driver(&Serial1, R_SENSE, 0b10);
-//TMC2209Stepper driver(&Serial1, R_SENSE, 0b11);
+#define DRIVER_ADDRESS 0b11  // BIGTREETECH default (MS1=HIGH, MS2=HIGH)
+TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 
 /* ===================== MECHANICS ===================== */
 #define STEPS_PER_REV   200
@@ -276,8 +279,16 @@ void updateDisplay() {
   display.setTextColor(SSD1306_WHITE);
 
   if(crashed){
-    display.setTextColor(SSD1306_INVERSE);
-    display.print("CRASHED");
+    display.setCursor(0, 0);
+    display.setTextSize(2);
+    display.println("CRASHED");
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println("UART Failed");
+    display.println("Check wiring:");
+    display.println("PDN->Pin 14");
+    display.println("VIO->5V");
+    display.display();
     return;
   }
 
@@ -337,14 +348,62 @@ void setup() {
 
   //Setup Phase 1
 #if DEBUG_I
-  Serial.println("Setup Phase 1...");
+  Serial.println("Setup Phase 1 - Initialize TMC UART...");
 #endif
 
-  Serial1.begin(115200);
+  //TMC_SERIAL.begin(115200);  // Hardware Serial3 at 115200 baud
+  TMC_SERIAL.begin(9600);  // slower speed for 4 foot line
+  delay(100);
+
+
+
+  Serial.println("================= SERIAL TESTING =====================");
+  Serial.println("Loopback test - pins 14 and 15 should be connected together");
+
+    //-----------------------
+  // Send test data
+  Serial.println("Attempting to read TMC2209 version register...");
+  
+  // Try to read version register (this is what driver.version() does internally)
+  TMC_SERIAL.write(0x05);  // Read register command
+  TMC_SERIAL.write(0x00);  // Register address for VERSION
+  delay(50);
+  
+  Serial.print("Bytes available to read: ");
+  Serial.println(TMC_SERIAL.available());
+  
+  if (TMC_SERIAL.available() > 0) {
+    Serial.println("Got response from TMC2209!");
+    while (TMC_SERIAL.available()) {
+      byte b = TMC_SERIAL.read();
+      Serial.print("0x");
+      Serial.print(b, HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  } else {
+    Serial.println("No response from TMC2209 - UART communication failed");
+  }
+  //-----------------------
+  Serial.println("------------- NEXT TEST - LOOPBACK ----------------");
+  TMC_SERIAL.write(0xAA);
+  delay(10);
+  
+  if (TMC_SERIAL.available()) {
+    byte received = TMC_SERIAL.read();
+    Serial.print("Received: 0x");
+    Serial.println(received, HEX);
+    if (received == 0xAA) {
+      Serial.println("SUCCESS - Serial3 hardware is working!");
+    }
+  } else {
+    Serial.println("FAILED - No data received. Hardware Serial3 problem.");
+  }
+  Serial.println("=============== END SERIAL TESTING ===================");
 
   //Setup Phase 2
 #if DEBUG_I
-  Serial.println("Setup Phase 2...");
+  Serial.println("Setup Phase 2 - Configure pins...");
 #endif
 
 
@@ -363,34 +422,90 @@ void setup() {
 
   //Setup Phase 3
 #if DEBUG_I
-  Serial.println("Setup Phase 3...");
+  Serial.println("Setup Phase 3 - Initialize TMC2209...");
 #endif
+
   driver.begin();
+  delay(100);  // Critical delay for driver initialization
+  
   driver.pdn_disable(true);
+  delay(50);
+  
   driver.toff(5);
+  delay(10);
+  
+  // First diagnostic check
+  uint8_t version = driver.version();
+  Serial.print("TMC2209 VERSION=0x");
+  Serial.println(version, HEX);
+  
+  uint32_t ioin = driver.IOIN();
+  Serial.print("TMC2209 IOIN=0x");
+  Serial.println(ioin, HEX);
   
   uint32_t drv = driver.DRV_STATUS();
   Serial.print("TMC2209 DRVSTATUS=0x");
   Serial.println(drv, HEX);
 
+  if (version == 0x21) {
+    Serial.println("*** TMC2209 detected successfully! ***");
+    // Decode MS1/MS2 from IOIN
+    Serial.print("MS1 pin state: ");
+    Serial.println((ioin >> 24) & 0x01);
+    Serial.print("MS2 pin state: ");
+    Serial.println((ioin >> 25) & 0x01);
+  }
+
   driver.blank_time(24);
+  delay(10);
+  
   driver.irun(IRUN_VALUE);
+  delay(10);
+  
   driver.ihold(IHOLD_VALUE);
+  delay(10);
+  
   driver.iholddelay(IHOLDDELAY);
-  driver.microsteps(16);
+  delay(10);
+  
+  driver.microsteps(MICROSTEPS);
+  delay(10);
+  
   driver.en_spreadCycle(true);
+  delay(10);
+  
   driver.SGTHRS(SGTHRS_VALUE);
+  delay(10);
 
   stepper.setEnablePin(ENABLE_PIN);
   stepper.enableOutputs();
+  delay(50);
 
-  //IS THE DRIVER AWAKE AND RESPONDING VIA uart?
-  if (driver.DRV_STATUS() == 0x00000000){
+  // Second status check after configuration
+  drv = driver.DRV_STATUS();
+  Serial.print("TMC2209 DRVSTATUS after config=0x");
+  Serial.println(drv, HEX);
+
+  //IS THE DRIVER AWAKE AND RESPONDING VIA UART?
+  if (version != 0x21 || drv == 0x00000000){
     Serial.println("****************************************************");
     Serial.println("UART FAILED on the TMC2209 board.  Nothing will work.");
     Serial.println("****************************************************");
-
+    Serial.println("Troubleshooting:");
+    Serial.println("1. Connect PDN_UART to MEGA Pin 14 (TX3)");
+    Serial.println("2. Verify VIO connected to 5V");
+    Serial.println("3. Verify VM connected to 12V");
+    Serial.println("4. Check all GND connections");
+    Serial.println("5. Try different DRIVER_ADDRESS values");
+    Serial.println("   Current: 0b11 (for BIGTREETECH default)");
+    Serial.println("****************************************************");
     crashed = true;    
+  }
+  else{
+    Serial.println("****************************************************");
+    Serial.println("               HAPPY DAY!!!!!!");
+    Serial.println("    UART responded correctly!");
+    Serial.println("****************************************************");
   }
 
   
@@ -398,22 +513,18 @@ void setup() {
 
 //Setup Phase 4
 #if DEBUG_I
-  Serial.println("Setup Phase 4...");
+  Serial.println("Setup Phase 4 - Initialize OLED...");
 #endif
 
   Wire.begin();
-
-  //original
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  //possible
-  //display.begin(SSD1306_SWITCHCAPVCC, 0x3D);
 
 //Setup Phase 5
 #if DEBUG_I
-  Serial.println("Setup Phase 5...");
+  Serial.println("Setup Phase 5 - Load settings...");
 #endif
 
-if(!crashed){
+  if(!crashed){
   
     loadLabels();
   
@@ -427,12 +538,9 @@ if(!crashed){
     }
   
   }
-  else{
-    //try to show a message on the display
-        
-  }
+
 #if DEBUG_I
-  Serial.println("End Setup!");
+  Serial.println("End Setup!"); 
 #endif
 
 }
