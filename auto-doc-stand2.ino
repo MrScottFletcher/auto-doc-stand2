@@ -48,7 +48,7 @@ AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 /* ===================== TMC2209 ===================== */
 #define R_SENSE 0.11f
-#define DRIVER_ADDRESS 0b11  // BIGTREETECH default (MS1=HIGH, MS2=HIGH)
+#define DRIVER_ADDRESS 0b10  // BIGTREETECH default (MS1=HIGH, MS2=HIGH)
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 
 /* ===================== MECHANICS ===================== */
