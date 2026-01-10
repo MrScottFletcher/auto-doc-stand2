@@ -86,22 +86,22 @@ TMC2209Stepper driver(&Serial3, R_SENSE, TMC_ADDR);
 // Example: if you want 200mm travel, and your lead screw is 8mm/rev,
 // motor 200 steps/rev, microsteps 16 => steps/mm = (200*16)/8 = 400 steps/mm
 // maxSteps = 200mm * 400 = 80000
-static const int32_t MAX_TRAVEL_STEPS = 80000;
+static const unsigned long MAX_TRAVEL_STEPS = 655000;
 
 // Speeds (Hz = steps/sec). Tune these.
 static const uint32_t FAST_SPEED_HZ = 30000;
-static const uint32_t SLOW_SPEED_HZ = 6000;
+static const uint32_t SLOW_SPEED_HZ = 4000;
 
 // Acceleration in steps/s^2. Tune for smoothness vs speed.
 static const uint32_t ACCEL_STEPS_S2 = 120000;
 
 // Homing speed (slow and gentle)
-static const uint32_t HOME_SPEED_HZ = 4000;
+static const uint32_t HOME_SPEED_HZ = 30000; //orig value 4000
 
 // Joystick
 static const int JOG_DEADBAND = 60; // analog units around center (~512)
-static const uint32_t JOG_MAX_SPEED_HZ = 12000; // max jog rate
-static const uint32_t JOG_MIN_SPEED_HZ = 1200;  // minimum when outside deadband
+static const uint32_t JOG_MAX_SPEED_HZ = 36000; // max jog rate -- 12000
+static const uint32_t JOG_MIN_SPEED_HZ = 3600;  // minimum when outside deadband -- 1200
 
 // Debounce
 static const uint16_t BTN_DEBOUNCE_MS = 35;
@@ -113,7 +113,7 @@ static const int EEPROM_ADDR = 0;
 struct PersistData {
   uint32_t magic;
   uint8_t  hasValidPosition;   // 1 if lastPosition is trusted
-  int32_t  lastPositionSteps;  // 0 at home (bottom)
+  //  int32_t  lastPositionSteps;  // 0 at home (bottom)
   int32_t  presets[5];         // preset positions
   uint16_t crc;                // simple checksum
 };
@@ -180,7 +180,8 @@ static bool isPressed(uint8_t pin) {
 
 static int32_t clampPos(int32_t p) {
   if (p < 0) return 0;
-  if (p > MAX_TRAVEL_STEPS) return MAX_TRAVEL_STEPS;
+  //TEMP Just for initial testing - uncomment this when you figure out the Max Pos
+  //if (p > MAX_TRAVEL_STEPS) return MAX_TRAVEL_STEPS;
   return p;
 }
 
@@ -204,9 +205,12 @@ static void oledProgressBar(uint8_t y, uint8_t h, float frac) {
   display.fillRect(1, y + 1, (int)((w - 1) * frac), h - 2, SSD1306_WHITE);
 }
 
+//==========================
+//EEPROM can only handle about 100,000 writes.
+//We're not going to burn out our EEPROM just for this.
 static void savePersist() {
-  persist.lastPositionSteps = stepper ? stepper->getCurrentPosition() : persist.lastPositionSteps;
-  persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
+//  persist.lastPositionSteps = stepper ? stepper->getCurrentPosition() : persist.lastPositionSteps;
+//  persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
 
   // compute crc over everything except crc field
   persist.crc = 0;
@@ -227,18 +231,21 @@ static bool loadPersist() {
   if (stored != calc) return false;
 
   for (int i = 0; i < 5; i++) persist.presets[i] = clampPos(persist.presets[i]);
-  persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
+  
+  //persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
   return true;
 }
+
 
 static void initDefaultPersist() {
   memset(&persist, 0, sizeof(persist));
   persist.magic = EEPROM_MAGIC;
-  persist.hasValidPosition = 0;
-  persist.lastPositionSteps = 0;
+//  persist.hasValidPosition = 0;
+//  persist.lastPositionSteps = 0;
   for (int i = 0; i < 5; i++) persist.presets[i] = 0;
   savePersist();
 }
+//==========================
 
 static void enterError(const String& err) {
   mode = Mode::IN_ERROR;
@@ -346,8 +353,8 @@ static bool initStepper() {
   stepper->setSpeedInHz(SLOW_SPEED_HZ);
   stepper->setAcceleration(ACCEL_STEPS_S2);
 
-  // If we trust EEPROM position, we will set this on boot.
-  stepper->setCurrentPosition(0);
+  //We're not going to do EEPROM - can only write about 100,000 times
+  stepper->setCurrentPosition(MAX_TRAVEL_STEPS);
   return true;
 }
 
@@ -383,14 +390,14 @@ static void processHoming() {
 
     // Back off a little to release switch, then approach slowly again for repeatability
     stepper->setCurrentPosition(0); // temporary
-    stepper->setSpeedInHz(3000);
+    stepper->setSpeedInHz(3000); //orig 3000
     stepper->moveTo(2000); // move up away from switch
     while (stepper->isRunning()) {
       if (estopRequested) return;
     }
 
     // Final approach to switch slowly
-    stepper->setSpeedInHz(1500);
+    stepper->setSpeedInHz(1500); //orig 1500
     stepper->moveTo(-4000);
     while (stepper->isRunning()) {
       if (isPressed(HOME_PIN)) {
@@ -406,7 +413,7 @@ static void processHoming() {
     // Set true home at switch
     stepper->setCurrentPosition(0);
     persist.hasValidPosition = 1;
-    persist.lastPositionSteps = 0;
+    //persist.lastPositionSteps = 0;
     savePersist();
 
     dbgPrintln(F("[HOME] Homing complete. Position=0"));
@@ -653,8 +660,9 @@ static void persistPositionIfIdle() {
   if (mode == Mode::IDLING && persist.hasValidPosition) {
     int32_t cur = clampPos(stepper->getCurrentPosition());
     if (cur != lastSavedPos && (now - lastSaveMs) > 1500) {
-      persist.lastPositionSteps = cur;
-      savePersist();
+      //We're not going to do EEPROM - can only write about 100,000 times
+      //      persist.lastPositionSteps = cur;
+      //      savePersist();
       lastSavedPos = cur;
       lastSaveMs = now;
     }
@@ -683,6 +691,7 @@ void setup() {
     dbgPrintln(F("[OLED] Not available; continuing headless."));
   }
 
+  //We need to load the Preset buttons
   if (!loadPersist()) {
     dbgPrintln(F("[EEPROM] No valid data; initializing defaults."));
     initDefaultPersist();
@@ -705,21 +714,35 @@ void setup() {
     return;
   }
 
-  // Set initial position from EEPROM if trusted; otherwise home
-  if (persist.hasValidPosition) {
-    stepper->setCurrentPosition(persist.lastPositionSteps);
-    dbgPrintf("[BOOT] Using stored position: %ld\n", (long)persist.lastPositionSteps);
+  //We're not going to do EEPROM - can only write about 100,000 times
+  //// Set initial position from EEPROM if trusted; otherwise home
+  //  if (persist.hasValidPosition) {
+  //    stepper->setCurrentPosition(persist.lastPositionSteps);
+  //    dbgPrintf("[BOOT] Using stored position: %ld\n", (long)persist.lastPositionSteps);
+  //
+  //    oledClear();
+  //    oledLine(0, F("Ready (no home)"));
+  //    oledLine(1, "Pos: " + String(persist.lastPositionSteps));
+  //    display.display();
+  //
+  //    enterMode(Mode::IDLING);
+  //  } else {
+  //    dbgPrintln(F("[BOOT] No valid position; homing required."));
+  //    startHoming();
+  //  }
 
+    //On power up, just assume we're at the top.  Need to rehome every time.
+    //We cuold use a series of limit switches to shorten the journey some day.
+    stepper->setCurrentPosition(MAX_TRAVEL_STEPS);
+    
     oledClear();
     oledLine(0, F("Ready (no home)"));
-    oledLine(1, "Pos: " + String(persist.lastPositionSteps));
+    //oledLine(1, "Pos: " + String(persist.lastPositionSteps));
+    oledLine(1, "Pos: ZERO BUT WRONG?");
     display.display();
 
     enterMode(Mode::IDLING);
-  } else {
-    dbgPrintln(F("[BOOT] No valid position; homing required."));
-    startHoming();
-  }
+
 }
 
 /* ===================== LOOP ===================== */
@@ -751,9 +774,10 @@ void loop() {
   // If we’re moving to a preset, detect arrival and go idle + save position.
   if (mode == Mode::MOVE_TO_PRESET) {
     if (!stepper->isRunning()) {
-      persist.lastPositionSteps = clampPos(stepper->getCurrentPosition());
-      persist.hasValidPosition = 1;
-      savePersist();
+      //We're not going to do EEPROM - can only write about 100,000 times
+      //      persist.lastPositionSteps = clampPos(stepper->getCurrentPosition());
+      //      persist.hasValidPosition = 1;
+      //      savePersist();
       currentPresetIndex = 255;
       enterMode(Mode::IDLING);
     }
