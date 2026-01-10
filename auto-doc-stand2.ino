@@ -16,9 +16,9 @@
 #include <Adafruit_SSD1306.h>
 
 /* ===================== DEBUG ===================== */
-#define DEBUG_V 1   // very verbose (loops, OLED refresh)
-#define DEBUG_I 1   // informational (state changes)
-#define DEBUG_E 1   // errors / warnings
+#define DEBUG_V 1
+#define DEBUG_I 1
+#define DEBUG_E 1
 
 #define DBG_V(x) do { if (DEBUG_V) Serial.println(x); } while(0)
 #define DBG_I(x) do { if (DEBUG_I) Serial.println(x); } while(0)
@@ -29,7 +29,6 @@
 #define DIR_PIN      48
 #define ENABLE_PIN   44
 
-#define DIAG_PIN     19
 #define ESTOP_PIN     2
 #define REHOME_PIN    3
 
@@ -89,16 +88,11 @@ TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 enum Mode { HOMING, IDLE, JOGGING, MOVING, STOPPING };
 Mode mode = HOMING;
 
-
-volatile bool stallDetected = false;
-volatile bool stallDetected_Displayed = false;
-
 volatile bool estopTriggered = false;
 volatile bool estopTriggered_Displayed = false;
 
 volatile bool rehomeTriggered = false;
 volatile bool rehomeTriggered_Displayed = false;
-
 
 long minPos = 0;
 long maxPos = 0;
@@ -110,19 +104,19 @@ long moveStartPos = 0;
 long moveTargetPos = 0;
 
 /* ===================== STALLGUARD ===================== */
-#define HOME_FAST_SPEED 30000UL // orig 10000UL
-#define HOME_FAST_ACCEL 20000UL // orig 20000UL
+#define HOME_FAST_SPEED 30000UL
+#define HOME_FAST_ACCEL 20000UL
 
-#define HOME_SLOW_SPEED 10000UL // orig 1500UL
-#define HOME_SLOW_ACCEL 3000UL // orig 3000UL
+#define HOME_SLOW_SPEED 10000UL
+#define HOME_SLOW_ACCEL 3000UL
 
-#define HOME_BACKOFF    -100L // orig 300L
-//#define HOME_SEEK_BOTTOM -40000 // orig -40000
-//#define HOME_SEEK_TOP -20000 // orig -20000
+#define HOME_BACKOFF    -100L
 
 uint16_t sgFreeAvg = 0;
-uint16_t sgStallMin = 1203; //set the sensitivity with this.... i.e. TCMdriver.SGTHRS(120)
-uint16_t sgDerivedThrs = 100;
+uint16_t sgStallMin = 1203;
+
+uint16_t sgDerivedThrs = 150;
+
 uint8_t homingConfidence = 0;
 bool sgCalibrated = false;
 
@@ -132,6 +126,42 @@ uint16_t lastSG = 0;
 bool showCalSummary = false;
 unsigned long calSummaryStart = 0;
 #define CAL_SUMMARY_TIME 4000
+
+/* ===================== SOFTWARE STALL DETECTOR ===================== */
+#define SG_SAMPLE_MS     8
+#define SG_HITS_REQUIRED 6
+
+uint8_t sgHits = 0;
+unsigned long lastSGSample = 0;
+
+bool isStallCondition(uint16_t sg) {
+  // Normal TMC2209 behavior: SG_RESULT drops toward 0 at stall
+  DBG_I("sgDerivedThrs = " + String(sgDerivedThrs) + "  current: " + String(sg));
+  return (sg <= sgDerivedThrs);
+}
+
+bool softwareStallDetected() {
+
+  if (millis() - lastSGSample < SG_SAMPLE_MS) return false;
+  lastSGSample = millis();
+
+  uint16_t sg = driver.SG_RESULT();
+  lastSG = sg;
+
+  if (isStallCondition(sg)) {
+    if (++sgHits >= SG_HITS_REQUIRED) {
+      return true;
+    }
+  } else {
+    sgHits = 0;
+  }
+
+  return false;
+}
+
+void resetSoftwareStall() {
+  sgHits = 0;
+}
 
 /* ===================== HELPERS ===================== */
 float stepsToMM(long s) {
@@ -143,11 +173,6 @@ bool withinLimits(long p) {
 }
 
 /* ===================== ISR ===================== */
-void stallISR()  { 
-  stallDetected = true;
-  stallDetected_Displayed = false;
-}
-
 void estopISR()  { 
   estopTriggered = true; 
   estopTriggered_Displayed = false; 
@@ -177,7 +202,6 @@ void saveSGCalibration() {
   EEPROM.put(EE_SG_THR, sgDerivedThrs);
   EEPROM.write(EE_SG_CONF, homingConfidence);
 }
-
 
 /* ===================== DISPLAY ===================== */
 void drawSGBar(int y) {
@@ -242,27 +266,12 @@ void updateDisplay() {
   display.display();
 }
 
-
 /* ===================== HOMING ===================== */
 void homeAxis() {
 
-  DBG_I("Checking the existing SGTHRS value...");
-  uint8_t sgt = driver.SGTHRS();
-  delay(15);
-  DBG_I("SGTHRS readback = " + String(sgt));
-  if(sgt > 200){
-    DBG_I("Setting a new SGTHRS value...");
-    driver.SGTHRS(50);
-    delay(20);
-    sgt = driver.SGTHRS();
-    DBG_I("SGTHRS is now  = " + String(sgt));
-    delay(50);
-  }
-  
   DBG_I("======= BEGIN HOME AXIS! ========");
-  stallDetected = false;
-  
-  // Phase 1: Fast seek
+
+  // Phase 1: Fast seek (coarse)
   stepper->setSpeedInHz(HOME_FAST_SPEED);
   stepper->setAcceleration(HOME_FAST_ACCEL);
   driver.irun(RUN_IRUN);
@@ -270,12 +279,12 @@ void homeAxis() {
   driver.TCOOLTHRS(0);
   delay(15);
 
-  DBG_I("COARSE Move 1a to bottom STARTED.");
+  DBG_I("COARSE Move to bottom STARTED.");
   stepper->moveTo(-200000);
   while (stepper->isRunning());
-  DBG_I("-- COARSE Move 1a STOPPED.");
-  
-  // Phase 2: Slow refine + StallGuard
+  DBG_I("-- COARSE Move STOPPED.");
+
+  // Phase 2: Slow refine + Software StallGuard
   stepper->setSpeedInHz(HOME_SLOW_SPEED);
   stepper->setAcceleration(HOME_SLOW_ACCEL);
   driver.irun(HOME_IRUN);
@@ -287,22 +296,27 @@ void homeAxis() {
   uint32_t sgSum = 0;
   uint16_t sgCount = 0;
   sgStallMin = 1023;
-  stallDetected = false;
+  resetSoftwareStall();
 
-  DBG_I("Beginnning FINE Move 1b to bottom.");
+  DBG_I("FINE Move to bottom with StallGuard.");
   stepper->moveTo(-400000);
-  while (!stallDetected && stepper->isRunning()) {
-    lastSG = driver.SG_RESULT();
-    sgSum += lastSG;
+  while (stepper->isRunning()) {
+
+    uint16_t sg = driver.SG_RESULT();
+    lastSG = sg;
+
+    sgSum += sg;
     sgCount++;
-    if (lastSG < sgStallMin) sgStallMin = lastSG;
+    if (sg < sgStallMin) sgStallMin = sg;
+
+    if (softwareStallDetected()) {
+      DBG_I("SOFTWARE STALL DETECTED (BOTTOM)");
+      break;
+    }
   }
+
   stepper->stopMove();
   while (stepper->isRunning());
-
-  DBG_I("-- FINE Move 1b stopped.");
-  DBG_I("stallDetected? " + String(stallDetected));
-  DBG_I("maxPos = " + String(maxPos));
 
   stepper->move(HOME_BACKOFF);
   while (stepper->isRunning());
@@ -310,7 +324,7 @@ void homeAxis() {
   DBG_I("SETTING current position to zero.");
   stepper->setCurrentPosition(0);
   minPos = 0;
-  //================================
+
   // Auto-calibration
   if (!sgCalibrated && sgCount > 10) {
     sgFreeAvg = sgSum / sgCount;
@@ -325,17 +339,25 @@ void homeAxis() {
   }
 
   // Find max
-  DBG_I("Fine Move 2a to top STARTED.");
+  DBG_I("FINE Move to top with StallGuard.");
 
-  stallDetected = false;
+  resetSoftwareStall();
   stepper->moveTo(400000);
-  while (!stallDetected && stepper->isRunning());
+  while (stepper->isRunning()) {
+
+    uint16_t sg = driver.SG_RESULT();
+    lastSG = sg;
+
+    if (softwareStallDetected()) {
+      DBG_I("SOFTWARE STALL DETECTED (TOP)");
+      break;
+    }
+  }
+
   stepper->stopMove();
   while (stepper->isRunning());
-  DBG_I("-- COARSE Move 1b STOPPED (no more moves).");
-  
+
   maxPos = stepper->getCurrentPosition();
-  DBG_I("stallDetected? " + String(stallDetected));
   DBG_I("maxPos = " + String(maxPos));
   
   EEPROM.put(EE_MAXPOS, maxPos);
@@ -346,12 +368,9 @@ void homeAxis() {
   stepper->setAcceleration(FAST_ACCEL);
 
   mode = IDLE;
-  
-  //Clear any button presses during the moves.
   rehomeTriggered = false;
   
-  DBG_I("===== HOME AXIS COMPLETE ==============");
-
+  DBG_I("===== HOME AXIS COMPLETE =====");
 }
 
 void dumpTMC2209() {
@@ -398,56 +417,37 @@ void dumpTMC2209() {
 
   Serial.println(F("================================"));
 }
-
 /* ===================== SETUP ===================== */
 void setup() {
 
   Serial.begin(115200);
-
-
   DBG_I("===== SETUP START =====");
+
   TMC_SERIAL.begin(115200);
 
-  //pinMode(DIAG_PIN, INPUT_PULLUP);   // force it high if nothing is pulling it down
-  pinMode(DIAG_PIN, INPUT);   // force it high if nothing is pulling it down
-  delay(10);
-  Serial.print("DIAG PIN reads: ");
-  Serial.println(digitalRead(DIAG_PIN));  // should print 1 if it can rise
-
-  delay(1000);
-
-  
   pinMode(ESTOP_PIN, INPUT_PULLUP);
   pinMode(REHOME_PIN, INPUT_PULLUP);
   pinMode(STORE_PIN, INPUT_PULLUP);
   for (int i = 0; i < 5; i++) pinMode(presetPins[i], INPUT_PULLUP);
 
-  DBG_I("Attaching interrupts...");
-  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(REHOME_PIN), rehomeISR, FALLING);
 
-  DBG_I("Initializing TMC2209...");
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
   stepper->setDirectionPin(DIR_PIN);
   stepper->setEnablePin(ENABLE_PIN);
   stepper->setAutoEnable(true);
 
-  DBG_I("Initializing UART...");
   driver.begin();
 
-  DBG_I("Reading TMC2209 version...");
   uint8_t version = driver.version();
-  
   if (version != 0x21) {
-      DBG_E("ERROR: TMC2209 not responding on UART");
-    } 
-    else {
-      DBG_I("TMC2209 detected OK");
-    }
+    DBG_E("ERROR: TMC2209 not responding on UART");
+  } else {
+    DBG_I("TMC2209 detected OK");
+  }
 
- 
   driver.pdn_disable(true);
   delay(15);
   driver.toff(5);
@@ -457,73 +457,44 @@ void setup() {
   
   driver.en_spreadCycle(true);
   delay(15);
-  driver.pwm_autoscale(false); // Disable StealthChop
+  driver.pwm_autoscale(false);
   delay(15);
   driver.TCOOLTHRS(0xFFFFF);
   delay(15);
-  driver.GSTAT(0x7);  // clear reset/uvcp/otpw latches (writing 1 clears)
+  driver.GSTAT(0x7);
   delay(15);
 
-  
-  // - in case we don't have a good config yet.
-  //Then try 5, 10, 20, 30, 40, 60 while homing into a hard stop (with a safe current/speed).
-  //driver.SGTHRS(10);   // start here
-  driver.SGTHRS(25);   // start here
+  driver.SGTHRS(25);
   delay(15);
 
-  DBG_I("loadSGCalibration...");
   loadSGCalibration();
 
-  //SHOW DRIVER CONFIGURATION:
-  DBG_I("Checking the existing SGTHRS value...");
-  uint8_t sgt = driver.SGTHRS();
-  delay(15);
-
-  DBG_I("Wire.begin...");
   Wire.begin();
-  DBG_I("display.begin");
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
-  DBG_I("Loading StallGuard calibration from EEPROM");
   if (EEPROM.read(EE_HOMED)) {
-    DBG_I("EE_HOMED, so getting the values...");
-    DBG_I("--Getting MAX position");
     EEPROM.get(EE_MAXPOS, maxPos);
-    DBG_I("--Loading Presets");
     EEPROM.get(EE_PRESETS, presets);
-    DBG_I("--Getting last position");
     long last; EEPROM.get(EE_LASTPOS, last);
-    DBG_I("Setting initial position to last known position");
     stepper->setCurrentPosition(last);
     mode = IDLE;
   }
-  else{
-    DBG_I("StallGuard not yet calibrated?  EE_HOMED was not in EEPROM");
-  }
-  
+
   DBG_I("===== SETUP END =====");
-  
+
   dumpTMC2209();
-    
 }
 
 /* ===================== LOOP ===================== */
 void loop() {
 
- 
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'o') oledEnabled = !oledEnabled;
     if (c == 'r') EEPROM.write(EE_SG_VALID, 0x00);
   }
 
-  //Troubleshooting interrupts.   :(
   if (DEBUG_I){
-    if(stallDetected && !stallDetected_Displayed){
-      DBG_I("****************** STALL ISR HIT *********************");
-      stallDetected_Displayed = true;
-    }
-  
     if(estopTriggered && !estopTriggered_Displayed){
       DBG_I("****************** E-STOP ISR HIT *********************");
       estopTriggered_Displayed = true; 
