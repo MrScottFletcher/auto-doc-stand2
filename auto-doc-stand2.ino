@@ -1,11 +1,30 @@
 /*
-  Motorized Photo Stand Controller
-  Board: Elegoo MEGA 2560 R3
-  Driver: TMC2209 (UART + StallGuard)
+  Motorized Photo Stand Controller (Fresh Start)
+  Board: Arduino Mega 2560 R3
+  Stepper driver: BIGTREETECH TMC2209 v1.3 (UART on Serial3, addr 0b0)
   Motion: FastAccelStepper
-  Display: SSD1306 I2C 128x64
+  Display: GeekPi OLED I2C 128x64 (SSD1306)
 
-  STEP = 7, DIR = 48, ENABLE = 44
+  Step/Dir/En:
+    STEP_PIN   = 7
+    DIR_PIN    = 48
+    ENABLE_PIN = 44
+
+  Inputs:
+    Joystick Y = A0
+    Home/Min limit switch = D29 (to GND, use INPUT_PULLUP)
+    E-Stop button = D2 (INT0) (to GND, use INPUT_PULLUP)
+    Rehome button = D3 (INT1) (to GND, use INPUT_PULLUP)
+    Store button  = D4 (to GND, use INPUT_PULLUP)
+    Preset buttons: D31,33,35,37,39 (to GND, use INPUT_PULLUP)
+
+  Serial:
+    Serial  = USB console (optional, mirrors debug)
+    Serial1 = Debug output (115200)   (pins TX1=18, RX1=19)
+    Serial3 = TMC UART (115200)       (pins TX3=14, RX3=15)
+
+  OLED I2C:
+    SDA = 20, SCL = 21 on Mega
 */
 
 #include <FastAccelStepper.h>
@@ -16,565 +35,737 @@
 #include <Adafruit_SSD1306.h>
 
 /* ===================== DEBUG ===================== */
-#define DEBUG_V 1
-#define DEBUG_I 1
-#define DEBUG_E 1
+#define DEBUG_ENABLED 1
 
-#define DBG_V(x) do { if (DEBUG_V) Serial.println(x); } while(0)
-#define DBG_I(x) do { if (DEBUG_I) Serial.println(x); } while(0)
-#define DBG_E(x) do { if (DEBUG_E) Serial.println(x); } while(0)
+static void dbgPrintln(const String& s) {
+#if DEBUG_ENABLED
+  Serial1.println(s);
+  Serial.println(s);
+#endif
+}
+static void dbgPrintf(const char* fmt, ...) {
+#if DEBUG_ENABLED
+  char buf[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial1.print(buf);
+  Serial.print(buf);
+#endif
+}
 
-/* ===================== PIN ASSIGNMENTS ===================== */
+/* ===================== PINS ===================== */
 #define STEP_PIN     7
 #define DIR_PIN      48
 #define ENABLE_PIN   44
 
-#define DIAG_PIN     19
-#define ESTOP_PIN     2
-#define REHOME_PIN    3
+#define JOY_PIN      A0
 
-#define STORE_PIN     4
-const uint8_t presetPins[5] = {31, 33, 35, 37, 39};
+#define HOME_PIN     19
 
-#define JOYSTICK_Y   A0
+#define ESTOP_PIN    2     // INT0
+#define REHOME_PIN   3     // INT1
 
-/* ===================== UART ===================== */
-#define TMC_SERIAL Serial3
+#define STORE_PIN    4
+static const uint8_t PRESET_PINS[5] = {31, 33, 35, 37, 39};
 
 /* ===================== OLED ===================== */
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
-bool oledEnabled = true;
-unsigned long lastDisplayUpdate = 0;
-#define DISPLAY_INTERVAL 150
-
-/* ===================== FAST STEPPER ===================== */
-FastAccelStepperEngine engine;
-FastAccelStepper *stepper = nullptr;
+#define OLED_ADDR    0x3C
+#define OLED_W       128
+#define OLED_H       64
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 
 /* ===================== TMC2209 ===================== */
 #define R_SENSE 0.11f
-#define DRIVER_ADDRESS 0b0
-TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
+#define TMC_ADDR 0b0
+TMC2209Stepper driver(&Serial3, R_SENSE, TMC_ADDR);
 
-/* ===================== MECHANICS ===================== */
-#define STEPS_PER_REV 200
-#define MICROSTEPS     8
-#define LEADSCREW_MM  8.0
+/* ===================== MOTION CONFIG ===================== */
+// You manually configure this max travel. Units are STEPS (after microsteps).
+// Example: if you want 200mm travel, and your lead screw is 8mm/rev,
+// motor 200 steps/rev, microsteps 16 => steps/mm = (200*16)/8 = 400 steps/mm
+// maxSteps = 200mm * 400 = 80000
+static const int32_t MAX_TRAVEL_STEPS = 80000;
 
-/* ===================== MOTION ===================== */
-#define FAST_SPEED    60000UL
-#define FAST_ACCEL   120000UL
+// Speeds (Hz = steps/sec). Tune these.
+static const uint32_t FAST_SPEED_HZ = 30000;
+static const uint32_t SLOW_SPEED_HZ = 6000;
 
-#define JOG_CHUNK      20000L
-#define JOG_DEADBAND   50
-#define JOG_MIN_SPEED  2000UL
+// Acceleration in steps/s^2. Tune for smoothness vs speed.
+static const uint32_t ACCEL_STEPS_S2 = 120000;
 
-//The MAX pos value for the length of screw travel - to limit the hunting around.
-#define MAX_POS        327173UL
+// Homing speed (slow and gentle)
+static const uint32_t HOME_SPEED_HZ = 4000;
 
-/* ===================== TMC CURRENT ===================== */
-#define RUN_IRUN   31
-#define HOME_IRUN  18
+// Joystick
+static const int JOG_DEADBAND = 60; // analog units around center (~512)
+static const uint32_t JOG_MAX_SPEED_HZ = 12000; // max jog rate
+static const uint32_t JOG_MIN_SPEED_HZ = 1200;  // minimum when outside deadband
 
-/* ===================== EEPROM ===================== */
-#define EE_HOMED        0
-#define EE_MAXPOS       1
-#define EE_LASTPOS      5
-#define EE_PRESETS      9
+// Debounce
+static const uint16_t BTN_DEBOUNCE_MS = 35;
 
-#define EE_SG_VALID    60
-#define EE_SG_FREEAVG  61
-#define EE_SG_STALLMIN 63
-#define EE_SG_THR      65
-#define EE_SG_CONF     67
+/* ===================== EEPROM LAYOUT ===================== */
+static const uint32_t EEPROM_MAGIC = 0x5053544E; // 'PSTN'
+static const int EEPROM_ADDR = 0;
+
+struct PersistData {
+  uint32_t magic;
+  uint8_t  hasValidPosition;   // 1 if lastPosition is trusted
+  int32_t  lastPositionSteps;  // 0 at home (bottom)
+  int32_t  presets[5];         // preset positions
+  uint16_t crc;                // simple checksum
+};
+
+static uint16_t simpleCrc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xA5A5;
+  for (size_t i = 0; i < len; i++) crc = (crc << 1) ^ data[i] ^ (crc >> 15);
+  return crc;
+}
+
+//Prototypes to help the compile understand the primacy
+enum class Mode : uint8_t;
+static void enterMode(Mode m);
+
+// Forward declarations to defeat Arduino auto-prototyping
+struct BtnState;
+static bool edgePressed(uint8_t pin, BtnState& st);
+static bool pressedEvent(uint8_t pin, BtnState& st);
 
 /* ===================== STATE ===================== */
-enum Mode { HOMING, IDLE, JOGGING, MOVING, STOPPING };
-Mode mode = HOMING;
+enum class Mode : uint8_t {
+  STARTUP,
+  IN_ERROR,
+  HOMING,
+  IDLING,
+  JOG,
+  MOVE_TO_PRESET,
+  STORE_ARMED,
+  ESTOP
+};
 
-volatile bool stallDetected = false;
-volatile bool estopTriggered = false;
-volatile bool rehomeTriggered = false;
+static Mode mode = Mode::STARTUP;
+static String lastError;
 
-long minPos = 0;
-long maxPos = 0;
-long presets[5];
-int activePreset = -1;
+FastAccelStepperEngine engine;
+FastAccelStepper* stepper = nullptr;
 
-/* ===== Motion tracking for progress bar ===== */
-long moveStartPos = 0;
-long moveTargetPos = 0;
+// Motion tracking for progress bar
+static int32_t moveStartPos = 0;
+static int32_t moveTargetPos = 0;
+static uint8_t currentPresetIndex = 255;
 
-/* ===================== STALLGUARD ===================== */
-//driver.TCOOLTHRS(500);
-#define HOME_FAST_TCOOLTHRS 500UL //500UL
-#define HOME_FAST_SPEED 30000UL //30000UL
-#define HOME_FAST_ACCEL 60000UL //20000UL
+// Store flow
+static bool storeArmed = false;
 
-//driver.TCOOLTHRS(2500);
-#define HOME_SLOW_TCOOLTHRS 2500UL //2500UL
-#define HOME_SLOW_SPEED 6000UL //10000UL
-#define HOME_SLOW_ACCEL 3000UL  //3000UL
+// Interrupt flags
+volatile bool estopRequested = false;
+volatile bool rehomeRequested = false;
 
-#define HOME_BACKOFF    5000L
+/* ===================== BUTTON EDGE TRACKING ===================== */
+struct BtnState {
+  bool lastLevel = true; // pullup, so true = not pressed
+  uint32_t lastChangeMs = 0;
+};
+static BtnState btnStore;
+static BtnState btnPreset[5];
 
-uint8_t homingConfidence = 0;
-bool sgCalibrated = false;
+static PersistData persist;
 
-uint16_t lastSG = 0;
-
-/* ===== Calibration summary ===== */
-bool showCalSummary = false;
-unsigned long calSummaryStart = 0;
-#define CAL_SUMMARY_TIME 4000
-
-/* ===================== SOFTWARE STALL DETECTOR ===================== */
-#define SG_TRIGGER_VALUE 2
-#define SG_SAMPLE_MS     16
-#define SG_HITS_REQUIRED 6
-
-uint8_t sgHits = 0;
-unsigned long lastSGSample = 0;
-
-bool isStallCondition(uint16_t sg) {
-  // Normal TMC2209 behavior: SG_RESULT drops toward 0 at stall
-  long pos = stepper->getCurrentPosition();
-  DBG_I("current pos: " + String(pos) + " ---- current SG: " + String(sg));
-  return (sg <= SG_TRIGGER_VALUE);
+/* ===================== UTILS ===================== */
+static bool isPressed(uint8_t pin) {
+  return digitalRead(pin) == LOW;
 }
 
-bool softwareStallDetected() {
-
-  if (millis() - lastSGSample < SG_SAMPLE_MS) return false;
-  lastSGSample = millis();
-
-  uint16_t sg = driver.SG_RESULT();
-  lastSG = sg;
-
-  if (isStallCondition(sg)) {
-    if (++sgHits >= SG_HITS_REQUIRED) {
-      return true;
-    }
-  } else {
-    sgHits = 0;
-  }
-
-  return false;
+static int32_t clampPos(int32_t p) {
+  if (p < 0) return 0;
+  if (p > MAX_TRAVEL_STEPS) return MAX_TRAVEL_STEPS;
+  return p;
 }
 
-void resetSoftwareStall() {
-  sgHits = 0;
+static void oledClear() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
 }
 
-/* ===================== HELPERS ===================== */
-float stepsToMM(long s) {
-  return (s * LEADSCREW_MM) / (STEPS_PER_REV * MICROSTEPS);
+static void oledLine(uint8_t row, const String& s) {
+  display.setCursor(0, row * 10);
+  display.print(s);
 }
 
-bool withinLimits(long p) {
-  return p >= minPos && p <= maxPos;
+static void oledProgressBar(uint8_t y, uint8_t h, float frac) {
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+  int w = OLED_W - 2;
+  display.drawRect(0, y, OLED_W, h, SSD1306_WHITE);
+  display.fillRect(1, y + 1, (int)((w - 1) * frac), h - 2, SSD1306_WHITE);
 }
 
-/* ===================== ISR ===================== */
-void stallISR()  { stallDetected = true; }
-void estopISR()  { estopTriggered = true; }
-void rehomeISR() { rehomeTriggered = true; }
+static void savePersist() {
+  persist.lastPositionSteps = stepper ? stepper->getCurrentPosition() : persist.lastPositionSteps;
+  persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
 
-/* ===================== EEPROM CAL ===================== */
-bool loadSGCalibration() {
-  if (EEPROM.read(EE_SG_VALID) != 0xA5) return false;
-  homingConfidence = EEPROM.read(EE_SG_CONF);
-  driver.SGTHRS(SG_TRIGGER_VALUE);
-  sgCalibrated = true;
+  // compute crc over everything except crc field
+  persist.crc = 0;
+  persist.crc = simpleCrc16((const uint8_t*)&persist, sizeof(PersistData));
+
+  EEPROM.put(EEPROM_ADDR, persist);
+  dbgPrintln(F("[EEPROM] Saved persist data."));
+}
+
+static bool loadPersist() {
+  EEPROM.get(EEPROM_ADDR, persist);
+  if (persist.magic != EEPROM_MAGIC) return false;
+
+  uint16_t stored = persist.crc;
+  PersistData tmp = persist;
+  tmp.crc = 0;
+  uint16_t calc = simpleCrc16((const uint8_t*)&tmp, sizeof(PersistData));
+  if (stored != calc) return false;
+
+  for (int i = 0; i < 5; i++) persist.presets[i] = clampPos(persist.presets[i]);
+  persist.lastPositionSteps = clampPos(persist.lastPositionSteps);
   return true;
 }
 
-void saveSGCalibration() {
-  EEPROM.write(EE_SG_VALID, 0xA5);
-  EEPROM.put(EE_SG_STALLMIN, SG_TRIGGER_VALUE);
-  EEPROM.write(EE_SG_CONF, homingConfidence);
+static void initDefaultPersist() {
+  memset(&persist, 0, sizeof(persist));
+  persist.magic = EEPROM_MAGIC;
+  persist.hasValidPosition = 0;
+  persist.lastPositionSteps = 0;
+  for (int i = 0; i < 5; i++) persist.presets[i] = 0;
+  savePersist();
 }
 
-/* ===================== HOMING ===================== */
-void homeAxis() {
-  
-  DBG_I("======= BEGIN HOME AXIS! ========");
-  
-  stallDetected = false;
-  bool bottomSet = false;
-  uint32_t sgSum = 0;
-  uint16_t sgCount = 0;
-
-  //======================================
-  // Phase 1: Fast seek
-  stepper->setSpeedInHz(HOME_FAST_SPEED);
-  stepper->setAcceleration(HOME_FAST_ACCEL);
-  driver.irun(RUN_IRUN);
-  delay(15);
-  driver.TCOOLTHRS(0);
-  delay(15);
-  //====================================== 
-  DBG_I("COARSE Move to bottom STARTED.");
-  stepper->moveTo(-200000);
-    while (stepper->isRunning()) {
-
-    uint16_t sg = driver.SG_RESULT();
-    lastSG = sg;
-
-    sgSum += sg;
-    sgCount++;
-
-    if (softwareStallDetected()) {
-      DBG_I("SOFTWARE STALL DETECTED (BOTTOM)");
-      bottomSet = true;
-      break;
-    }
-  }
-  DBG_I("-- COARSE Move STOPPED.");
-  if(bottomSet){
-    //backoff a bit
-    stepper->setCurrentPosition(0);
-    DBG_I("BACKING off bottom...");
-    delay(1000);
-    stepper->move(HOME_BACKOFF);
-    delay(1000);
-  }
-  
-  // Phase 2: Slow StallGuard refine
-  stepper->setSpeedInHz(HOME_SLOW_SPEED);
-  delay(10);
-  stepper->setAcceleration(HOME_SLOW_ACCEL);
-  delay(10);
-  driver.irun(HOME_IRUN);
-  delay(15);
-  
-  driver.TCOOLTHRS(0xFFFFF);
-  delay(15);
-
-  resetSoftwareStall();
-
-  DBG_I("FINE Move to bottom with StallGuard.");
-  stepper->moveTo(-400000);
-  while (stepper->isRunning()) {
-    uint16_t sg = driver.SG_RESULT();
-    lastSG = sg;
-
-    sgCount++;
-
-    if (softwareStallDetected()) {
-      DBG_I("SOFTWARE STALL DETECTED (BOTTOM)");
-      break;
-    }
-  }
-  //======================================
-  stepper->stopMove();
-  while (stepper->isRunning());
-  
-  DBG_I("SETTING current position to zero.");
-  stepper->setCurrentPosition(0);
-  minPos = 0;
-
-  delay(1000);
-  stepper->move(HOME_BACKOFF);
-  while (stepper->isRunning());
-  delay(1000);
-
-  driver.SGTHRS(SG_TRIGGER_VALUE);
-  // Auto-calibrate
-  if (!sgCalibrated && sgCount > 40) {
-    homingConfidence = 100;
-    saveSGCalibration();
-    showCalSummary = true;
-    calSummaryStart = millis();
-  }
-
-
-  //======================================
-  // Phase 2: Fast seek to the top
-  stepper->setSpeedInHz(HOME_FAST_SPEED);
-  stepper->setAcceleration(HOME_FAST_ACCEL);
-  driver.irun(RUN_IRUN);
-  delay(15);
-  driver.TCOOLTHRS(0);
-  delay(15);
-  //======================================
-  // Find max
-  DBG_I("Coarse Move to top with StallGuard.");
-
-  delay(50);
-  resetSoftwareStall();
-  delay(50);
-  
-  stepper->moveTo(MAX_POS);
-  while (stepper->isRunning()) {
-    uint16_t sg = driver.SG_RESULT();
-    lastSG = sg;
-    if (softwareStallDetected()) {
-      DBG_I("SOFTWARE STALL DETECTED (TOP)");
-      break;
-    }
-  }
-  
-  stepper->stopMove();
-  while (stepper->isRunning());
-
-  maxPos = stepper->getCurrentPosition();
-  DBG_I("maxPos = " + String(maxPos));
-  
-  EEPROM.put(EE_MAXPOS, maxPos);
-  EEPROM.write(EE_HOMED, 1);
-
-  driver.irun(RUN_IRUN);
-  stepper->setSpeedInHz(FAST_SPEED);
-  stepper->setAcceleration(FAST_ACCEL);
-
-  mode = IDLE;
-
-  rehomeTriggered = false;
-  DBG_I("===== HOME AXIS COMPLETE =====");
+static void enterError(const String& err) {
+  mode = Mode::IN_ERROR;
+  lastError = err;
+  dbgPrintln("[IN_ERROR] " + err);
 }
 
-/* ===================== DISPLAY ===================== */
-void drawSGBar(int y) {
-  int w = map(lastSG, 0, 1023, 0, 120);
-  const char* zone =
-    lastSG > SG_TRIGGER_VALUE + 150 ? "SAFE" :
-    lastSG > SG_TRIGGER_VALUE + 40  ? "WARN" : "STALL";
-
-  display.setCursor(0, y);
-  display.print("SG ");
-  display.print(zone);
-  display.drawRect(30, y, 98, 6, SSD1306_WHITE);
-  display.fillRect(31, y + 1, w, 4, SSD1306_WHITE);
+static void enterMode(Mode m) {
+  mode = m;
 }
 
-void updateDisplay() {
+/* ===================== DRIVER DUMP ===================== */
+static void dumpDriverStatus() {
+  dbgPrintln(F("=== TMC2209 Driver Dump ==="));
 
-  if (!oledEnabled) return;
-  if (millis() - lastDisplayUpdate < DISPLAY_INTERVAL) return;
-  lastDisplayUpdate = millis();
+  // A few key reads; if UART is dead, these often return 0 or 0xFFFFFFFF depending on bus.
+  uint32_t ioin = driver.IOIN();
+  uint32_t gstat = driver.GSTAT();
+  uint32_t chopconf = driver.CHOPCONF();
+  uint32_t pwmconf = driver.PWMCONF();
+  uint32_t ihold_irun = driver.IHOLD_IRUN();
+  uint32_t tpowerdown = driver.TPOWERDOWN();
+  uint32_t tpwmthrs = driver.TPWMTHRS();
+  uint32_t tcoolthrs = driver.TCOOLTHRS();
+  uint32_t sgthrs = driver.SGTHRS();
 
-  display.clearDisplay();
+  dbgPrintf("IOIN:       0x%08lX\n", (unsigned long)ioin);
+  dbgPrintf("GSTAT:      0x%02lX\n", (unsigned long)gstat);
+  dbgPrintf("CHOPCONF:   0x%08lX\n", (unsigned long)chopconf);
+  dbgPrintf("PWMCONF:    0x%08lX\n", (unsigned long)pwmconf);
+  dbgPrintf("IHOLD_IRUN: 0x%08lX\n", (unsigned long)ihold_irun);
+  dbgPrintf("TPOWERDOWN: 0x%02lX\n", (unsigned long)tpowerdown);
+  dbgPrintf("TPWMTHRS:   0x%08lX\n", (unsigned long)tpwmthrs);
+  dbgPrintf("TCOOLTHRS:  0x%08lX\n", (unsigned long)tcoolthrs);
+  dbgPrintf("SGTHRS:     0x%02lX\n", (unsigned long)sgthrs);
 
-  long pos = stepper->getCurrentPosition();
+  // Helpful derived values
+  dbgPrintf("Microsteps: %u\n", driver.microsteps());
+  dbgPrintf("IRUN:       %u\n", driver.irun());
+  dbgPrintf("IHOLD:      %u\n", driver.ihold());
 
-  if (showCalSummary && millis() - calSummaryStart < CAL_SUMMARY_TIME) {
-    display.setCursor(0, 0);
-    display.println("CALIBRATION OK");
-    display.print("POS: "); display.println(pos);
-    display.print("Conf: "); display.print(homingConfidence); display.print("%");
-    display.display();
-    return;
+  dbgPrintln(F("==========================="));
+}
+
+/* ===================== INTERRUPTS ===================== */
+void isrEstop() {
+  estopRequested = true;
+}
+void isrRehome() {
+  rehomeRequested = true;
+}
+
+/* ===================== INIT HARDWARE ===================== */
+static bool initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    dbgPrintln(F("[OLED] begin() failed."));
+    return false;
   }
-
-
-  display.setCursor(0, 0);
-  display.print("Pos ");
-  display.print(stepsToMM(pos), 1);
-  display.print(" mm");
-
-  display.setCursor(0, 10);
-  display.print("Mode ");
-  display.print(
-    mode == HOMING  ? "HOME" :
-    mode == MOVING  ? "GOTO" :
-    mode == JOGGING ? "JOG"  :
-    mode == STOPPING ? "STOP" : "IDLE"
-  );
-
-  if (mode == MOVING && moveTargetPos != moveStartPos) {
-    long total = abs(moveTargetPos - moveStartPos);
-    long done  = abs(pos - moveStartPos);
-    float pct = total > 0 ? (float)done / total : 1.0;
-    pct = constrain(pct, 0.0, 1.0);
-
-    display.drawRect(0, 22, 128, 6, SSD1306_WHITE);
-    display.fillRect(1, 23, (int)(126 * pct), 4, SSD1306_WHITE);
-  }
-
-  drawSGBar(32);
+  oledClear();
+  oledLine(0, F("Photo Stand"));
+  oledLine(1, F("Initializing..."));
   display.display();
+  return true;
 }
 
-void dumpTMC2209() {
-  Serial.println(F("===== TMC2209 CONFIG DUMP ====="));
+static bool initDriver() {
+  Serial3.begin(115200);
+  delay(50);
 
-  Serial.print(F("GCONF: 0x"));
-  Serial.println(driver.GCONF(), HEX);
+  driver.begin();
+  driver.pdn_disable(true);      // use UART
+  driver.I_scale_analog(false);  // use internal reference
+  driver.toff(5);
+  driver.blank_time(24);
+  driver.rms_current(900);       // tune to your motor
+  driver.microsteps(16);
+  driver.en_spreadCycle(false);  // stealthChop by default
+  driver.pwm_autoscale(true);
+  driver.TPOWERDOWN(10);
 
-  Serial.print(F("IHOLD_IRUN: 0x"));
-  Serial.println(driver.IHOLD_IRUN(), HEX);
-  Serial.print(F("  IHOLD: "));
-  Serial.println(driver.ihold());
-  Serial.print(F("  IRUN: "));
-  Serial.println(driver.irun());
-  Serial.print(F("  IHOLDDELAY: "));
-  Serial.println(driver.iholddelay());
+  // Quick comm sanity check
+  uint32_t ioin = driver.IOIN();
+  // If UART is floating/dead, IOIN is often 0xFFFFFFFF or 0
+  if (ioin == 0xFFFFFFFFUL || ioin == 0x00000000UL) {
+    dbgPrintf("[TMC] IOIN read suspicious: 0x%08lX\n", (unsigned long)ioin);
+    return false;
+  }
 
-  Serial.print(F("TPOWERDOWN: "));
-  Serial.println(driver.TPOWERDOWN());
+  // Clear driver errors
+  driver.GSTAT(0b111);
 
-  Serial.print(F("TPWMTHRS: "));
-  Serial.println(driver.TPWMTHRS());
-
-  Serial.print(F("TCOOLTHRS: "));
-  Serial.println(driver.TCOOLTHRS());
-
-  Serial.print(F("SGTHRS: "));
-  Serial.println(driver.SGTHRS());
-
-  Serial.print(F("CHOPCONF: 0x"));
-  Serial.println(driver.CHOPCONF(), HEX);
-
-  Serial.print(F("PWMCONF: 0x"));
-  Serial.println(driver.PWMCONF(), HEX);
-
-  Serial.print(F("DRV_STATUS: 0x"));
-  Serial.println(driver.DRV_STATUS(), HEX);
-
-  Serial.print(F("IOIN: 0x"));
-  Serial.println(driver.IOIN(), HEX);
-
-  Serial.print(F("GSTAT: 0x"));
-  Serial.println(driver.GSTAT(), HEX);
-
-  Serial.println(F("================================"));
+  dumpDriverStatus();
+  return true;
 }
 
-/* ===================== SETUP ===================== */
-void setup() {
-
-  Serial.begin(115200);
-  DBG_I("===== SETUP START =====");
-  TMC_SERIAL.begin(115200);
-
-  pinMode(DIAG_PIN, INPUT_PULLUP);
-  pinMode(ESTOP_PIN, INPUT_PULLUP);
-  pinMode(REHOME_PIN, INPUT_PULLUP);
-  pinMode(STORE_PIN, INPUT_PULLUP);
-  for (int i = 0; i < 5; i++) pinMode(presetPins[i], INPUT_PULLUP);
-
-  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), stallISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(REHOME_PIN), rehomeISR, FALLING);
-
+static bool initStepper() {
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
+  if (!stepper) return false;
+
   stepper->setDirectionPin(DIR_PIN);
   stepper->setEnablePin(ENABLE_PIN);
   stepper->setAutoEnable(true);
 
- uint8_t version = driver.version();
-  if (version != 0x21) {
-    DBG_E("*************************************");
-    DBG_I("*************************************");
-    DBG_V("*************************************");
-    DBG_E("ERROR: TMC2209 not responding on UART");
-    DBG_I("ERROR: TMC2209 not responding on UART");
-    DBG_V("ERROR: TMC2209 not responding on UART");
-    DBG_E("    -----------------------          ");
-    DBG_I("    -----------------------          ");
-    DBG_V("    -----------------------          ");
-    DBG_E("   NOTHING WILL WORK CORRECTLY       ");
-    DBG_I("   NOTHING WILL WORK CORRECTLY       ");
-    DBG_V("   NOTHING WILL WORK CORRECTLY       ");
-    DBG_E("*************************************");
-    DBG_I("*************************************");
-    DBG_V("*************************************");
+  stepper->setSpeedInHz(SLOW_SPEED_HZ);
+  stepper->setAcceleration(ACCEL_STEPS_S2);
+
+  // If we trust EEPROM position, we will set this on boot.
+  stepper->setCurrentPosition(0);
+  return true;
+}
+
+/* ===================== HOMING ===================== */
+static void startHoming() {
+  dbgPrintln(F("[HOME] Starting homing..."));
+  oledClear();
+  oledLine(0, F("Homing..."));
+  oledLine(1, F("Seeking bottom switch"));
+  display.display();
+
+  // Move down (assumes "down" direction corresponds to negative positions)
+  // If your direction is reversed, flip this by swapping motor wiring or invert DIR.
+  stepper->setSpeedInHz(HOME_SPEED_HZ);
+  stepper->setAcceleration(ACCEL_STEPS_S2);
+
+  // Move a long way down; we stop when switch hits.
+  stepper->moveTo(- (int32_t)MAX_TRAVEL_STEPS * 2L);
+
+  enterMode(Mode::HOMING);
+}
+
+static void processHoming() {
+  // If switch pressed, stop and set zero
+  if (isPressed(HOME_PIN)) {
+    stepper->stopMove(); // decelerates smoothly
+    while (stepper->isRunning()) {
+      // allow it to ramp down
+      if (estopRequested) break;
+    }
+
+    if (estopRequested) return;
+
+    // Back off a little to release switch, then approach slowly again for repeatability
+    stepper->setCurrentPosition(0); // temporary
+    stepper->setSpeedInHz(3000);
+    stepper->moveTo(2000); // move up away from switch
+    while (stepper->isRunning()) {
+      if (estopRequested) return;
+    }
+
+    // Final approach to switch slowly
+    stepper->setSpeedInHz(1500);
+    stepper->moveTo(-4000);
+    while (stepper->isRunning()) {
+      if (isPressed(HOME_PIN)) {
+        stepper->stopMove();
+        while (stepper->isRunning()) {
+          if (estopRequested) return;
+        }
+        break;
+      }
+      if (estopRequested) return;
+    }
+
+    // Set true home at switch
+    stepper->setCurrentPosition(0);
+    persist.hasValidPosition = 1;
+    persist.lastPositionSteps = 0;
+    savePersist();
+
+    dbgPrintln(F("[HOME] Homing complete. Position=0"));
+    enterMode(Mode::IDLING);
+  }
+
+  // If it somehow finishes moving without hitting the switch, error
+  if (!stepper->isRunning() && !isPressed(HOME_PIN)) {
+    enterError(F("Homing failed: switch never triggered."));
+  }
+}
+
+/* ===================== MOVES ===================== */
+static void startMoveTo(int32_t target, uint8_t presetIndexOr255) {
+  if (!stepper) return;
+  target = clampPos(target);
+
+  // If already moving, command a new moveTo() is the gentlest “interrupt”
+  // because FastAccelStepper uses accel/decel ramps.
+  if (stepper->isRunning()) {
+    // nothing special needed; moveTo() will change target and ramp accordingly
+  }
+
+  moveStartPos = stepper->getCurrentPosition();
+  moveTargetPos = target;
+  currentPresetIndex = presetIndexOr255;
+
+  // Use fast speed for long travel, but keep accel reasonable for camera stability.
+  stepper->setSpeedInHz(FAST_SPEED_HZ);
+  stepper->setAcceleration(ACCEL_STEPS_S2);
+
+  stepper->moveTo(target);
+
+  enterMode(Mode::MOVE_TO_PRESET);
+  dbgPrintf("[MOVE] Target=%ld preset=%u\n", (long)target, (unsigned)presetIndexOr255);
+}
+
+/* ===================== INPUT HANDLING ===================== */
+static bool edgePressed(uint8_t pin, BtnState& st) {
+  bool level = digitalRead(pin); // HIGH=idle, LOW=pressed
+  uint32_t now = millis();
+  if (level != st.lastLevel) {
+    st.lastChangeMs = now;
+    st.lastLevel = level;
+    return false;
+  }
+  // stable long enough and is LOW => pressed edge detection is handled elsewhere (simple)
+  return false;
+}
+
+static bool pressedEvent(uint8_t pin, BtnState& st) {
+  bool level = digitalRead(pin); // HIGH idle, LOW pressed
+  uint32_t now = millis();
+
+  if (level != st.lastLevel) {
+    // changed
+    st.lastLevel = level;
+    st.lastChangeMs = now;
+    return false;
+  }
+
+  // stable
+  if ((now - st.lastChangeMs) < BTN_DEBOUNCE_MS) return false;
+
+  // if currently LOW and we haven't emitted the event, emit once by shifting lastChangeMs far forward
+  if (level == LOW) {
+    st.lastChangeMs = now + 60000UL; // crude "latch" until release
+    return true;
+  }
+
+  // released: reset latch immediately
+  if (level == HIGH && st.lastChangeMs > now) st.lastChangeMs = now;
+  return false;
+}
+
+static void handleButtons() {
+  // Store button
+  if (pressedEvent(STORE_PIN, btnStore)) {
+    storeArmed = true;
+    enterMode(Mode::STORE_ARMED);
+    dbgPrintln(F("[STORE] Armed. Press preset button to save."));
+  }
+
+  // Preset buttons
+  for (int i = 0; i < 5; i++) {
+    if (pressedEvent(PRESET_PINS[i], btnPreset[i])) {
+      if (storeArmed) {
+        persist.presets[i] = clampPos(stepper->getCurrentPosition());
+        savePersist();
+        storeArmed = false;
+        dbgPrintf("[STORE] Saved preset %d = %ld\n", i + 1, (long)persist.presets[i]);
+        enterMode(Mode::IDLING);
+      } else {
+        // Interrupt current travel gently by simply issuing a new moveTo
+        startMoveTo(persist.presets[i], (uint8_t)i);
+      }
+    }
+  }
+}
+
+static void handleJoystick() {
+  // Only allow jog when not in homing/error/estop/store armed.
+  if (mode == Mode::HOMING || mode == Mode::IN_ERROR || mode == Mode::ESTOP || mode == Mode::STORE_ARMED) return;
+
+  int v = analogRead(JOY_PIN); // 0..1023
+  int delta = v - 512;
+
+  if (abs(delta) <= JOG_DEADBAND) {
+    // If we were jogging, stop smoothly and go idle
+    if (mode == Mode::JOG) {
+      stepper->stopMove();
+      enterMode(Mode::IDLING);
+    }
+    return;
+  }
+
+  // Map delta beyond deadband to speed
+  int mag = abs(delta) - JOG_DEADBAND;
+  int magMax = 512 - JOG_DEADBAND;
+  if (magMax < 1) magMax = 1;
+
+  uint32_t spd = (uint32_t)(JOG_MIN_SPEED_HZ + (uint32_t)(JOG_MAX_SPEED_HZ - JOG_MIN_SPEED_HZ) * (uint32_t)mag / (uint32_t)magMax);
+  if (spd < JOG_MIN_SPEED_HZ) spd = JOG_MIN_SPEED_HZ;
+  if (spd > JOG_MAX_SPEED_HZ) spd = JOG_MAX_SPEED_HZ;
+
+  // Direction: delta > 0 => up (positive), delta < 0 => down (negative)
+  int dir = (delta > 0) ? 1 : -1;
+
+  // Use "runForward/runBackward" style by commanding far-away target with accel ramps
+  stepper->setSpeedInHz(spd);
+  stepper->setAcceleration(ACCEL_STEPS_S2);
+
+  int32_t cur = stepper->getCurrentPosition();
+  int32_t target = cur + dir * 200000L; // "effectively continuous"
+  target = clampPos(target);
+
+  stepper->moveTo(target);
+  enterMode(Mode::JOG);
+}
+
+/* ===================== OLED UI ===================== */
+static void updateOLED() {
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  if (now - lastMs < 100) return; // 10 Hz
+  lastMs = now;
+
+  oledClear();
+  oledLine(0, F("Photo Stand"));
+
+  if (mode == Mode::IN_ERROR) {
+    oledLine(1, F("IN_ERROR:"));
+    oledLine(2, lastError.substring(0, 20));
+    oledLine(3, lastError.length() > 20 ? lastError.substring(20, 40) : "");
+    display.display();
+    return;
+  }
+
+  if (mode == Mode::ESTOP) {
+    oledLine(1, F("E-STOP!"));
+    oledLine(2, F("Reset required"));
+    oledLine(3, F("Press Rehome"));
+    display.display();
+    return;
+  }
+
+  // Mode text
+  String modeText;
+  switch (mode) {
+    case Mode::STARTUP: modeText = "Startup"; break;
+    case Mode::HOMING: modeText = "Homing"; break;
+    case Mode::IDLING: modeText = "Idle"; break;
+    case Mode::JOG: modeText = "Jog"; break;
+    case Mode::MOVE_TO_PRESET: modeText = "MoveToPreset"; break;
+    case Mode::STORE_ARMED: modeText = "Store: pick preset"; break;
+    default: modeText = "?"; break;
+  }
+
+  int32_t pos = stepper ? stepper->getCurrentPosition() : 0;
+  oledLine(1, "Mode: " + modeText);
+  oledLine(2, "Pos: " + String(pos));
+
+  // Preset number
+  if (mode == Mode::MOVE_TO_PRESET && currentPresetIndex != 255) {
+    oledLine(3, "Preset: " + String(currentPresetIndex + 1));
+  } else if (storeArmed) {
+    oledLine(3, F("STORE ARMED"));
   } else {
-    DBG_I("TMC2209 detected OK");
+    oledLine(3, F(""));
   }
 
-  driver.pdn_disable(true);
-  delay(15);
-  driver.toff(5);
-  delay(15);
-  driver.irun(RUN_IRUN);
-  delay(15);
-  
-  driver.en_spreadCycle(true);
-  delay(15);
-  driver.pwm_autoscale(false);
-  delay(15);
-  driver.TCOOLTHRS(0xFFFFF);
-  delay(15);
-  driver.GSTAT(0x7);
-  delay(15);
-
-  driver.SGTHRS(25);
-  delay(15);
-
-  loadSGCalibration();
-
-  Wire.begin();
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-
-  if (EEPROM.read(EE_HOMED)) {
-    EEPROM.get(EE_MAXPOS, maxPos);
-    EEPROM.get(EE_PRESETS, presets);
-    long last; EEPROM.get(EE_LASTPOS, last);
-    stepper->setCurrentPosition(last);
-    mode = IDLE;
+  // Progress bar while moving to a preset
+  if (mode == Mode::MOVE_TO_PRESET) {
+    int32_t cur = pos;
+    int32_t a = moveStartPos;
+    int32_t b = moveTargetPos;
+    float frac = 0.0f;
+    int32_t denom = abs(b - a);
+    if (denom > 0) frac = (float)abs(cur - a) / (float)denom;
+    oledProgressBar(52, 10, frac);
   }
-  DBG_I("===== SETUP END =====");
 
-  dumpTMC2209();
+  display.display();
+}
+
+/* ===================== MAIN LOOP HELPERS ===================== */
+static void handleEstopAndRehome() {
+  if (estopRequested) {
+    estopRequested = false;
+
+    if (stepper) {
+      stepper->forceStop(); // immediate
+      // Keep current position as-is
+    }
+    enterMode(Mode::ESTOP);
+    dbgPrintln(F("[ESTOP] Emergency stop triggered."));
+    return;
+  }
+
+  if (rehomeRequested) {
+    rehomeRequested = false;
+
+    if (mode == Mode::ESTOP || mode == Mode::IDLING || mode == Mode::JOG || mode == Mode::MOVE_TO_PRESET || mode == Mode::STORE_ARMED) {
+      // Stop motion gently, then home
+      if (stepper && stepper->isRunning()) {
+        stepper->stopMove();
+        while (stepper->isRunning()) {
+          if (estopRequested) return;
+        }
+      }
+      storeArmed = false;
+      startHoming();
+    }
+  }
+}
+
+static void persistPositionIfIdle() {
+  static uint32_t lastSaveMs = 0;
+  static int32_t lastSavedPos = 0;
+  uint32_t now = millis();
+
+  if (!stepper) return;
+
+  if (mode == Mode::IDLING && persist.hasValidPosition) {
+    int32_t cur = clampPos(stepper->getCurrentPosition());
+    if (cur != lastSavedPos && (now - lastSaveMs) > 1500) {
+      persist.lastPositionSteps = cur;
+      savePersist();
+      lastSavedPos = cur;
+      lastSaveMs = now;
+    }
+  }
+}
+
+/* ===================== SETUP ===================== */
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200);
+
+  pinMode(HOME_PIN, INPUT_PULLUP);
+  pinMode(ESTOP_PIN, INPUT_PULLUP);
+  pinMode(REHOME_PIN, INPUT_PULLUP);
+  pinMode(STORE_PIN, INPUT_PULLUP);
+  for (int i = 0; i < 5; i++) pinMode(PRESET_PINS[i], INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), isrEstop, FALLING);
+  attachInterrupt(digitalPinToInterrupt(REHOME_PIN), isrRehome, FALLING);
+
+  dbgPrintln(F("\n=== Photo Stand Controller Boot ==="));
+
+  bool oledOk = initOLED();
+  if (!oledOk) {
+    // continue without display
+    dbgPrintln(F("[OLED] Not available; continuing headless."));
+  }
+
+  if (!loadPersist()) {
+    dbgPrintln(F("[EEPROM] No valid data; initializing defaults."));
+    initDefaultPersist();
+  } else {
+    dbgPrintln(F("[EEPROM] Loaded saved state."));
+  }
+
+  if (!initStepper()) {
+    enterError(F("FastAccelStepper init failed."));
+    return;
+  }
+
+  oledClear();
+  oledLine(0, F("Init driver..."));
+  display.display();
+
+  if (!initDriver()) {
+    // Show and log error on startup as requested
+    enterError(F("TMC2209 UART failed (IOIN read invalid). Check TX3/RX3, GND, PDN_UART wiring."));
+    return;
+  }
+
+  // Set initial position from EEPROM if trusted; otherwise home
+  if (persist.hasValidPosition) {
+    stepper->setCurrentPosition(persist.lastPositionSteps);
+    dbgPrintf("[BOOT] Using stored position: %ld\n", (long)persist.lastPositionSteps);
+
+    oledClear();
+    oledLine(0, F("Ready (no home)"));
+    oledLine(1, "Pos: " + String(persist.lastPositionSteps));
+    display.display();
+
+    enterMode(Mode::IDLING);
+  } else {
+    dbgPrintln(F("[BOOT] No valid position; homing required."));
+    startHoming();
+  }
 }
 
 /* ===================== LOOP ===================== */
 void loop() {
-
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == 'o') oledEnabled = !oledEnabled;
-    if (c == 'r') EEPROM.write(EE_SG_VALID, 0x00);
+  if (mode == Mode::IN_ERROR) {
+    updateOLED();
+    return;
   }
 
- if (estopTriggered) {
-    DBG_I("BUTTON - ESTOP triggered");
-    estopTriggered = false;
-    stepper->stopMove();
-    mode = STOPPING;
+  handleEstopAndRehome();
+  if (mode == Mode::ESTOP) {
+    updateOLED();
+    return;
   }
 
-  if (rehomeTriggered) {
-    DBG_I("BUTTON - Rehome requested");
-    rehomeTriggered = false;
-    stepper->stopMove();
-    mode = HOMING;
+  // Homing logic
+  if (mode == Mode::HOMING) {
+    processHoming();
+    updateOLED();
+    return;
   }
 
-  if (mode == HOMING) homeAxis();
-  if (mode == STOPPING && !stepper->isRunning()) mode = IDLE;
+  // If store armed, still allow the preset buttons + display updates; do not jog.
+  handleButtons();
 
-  int joy = analogRead(JOYSTICK_Y) - 512;
-  if (abs(joy) > JOG_DEADBAND && mode == IDLE) {
-    stepper->setSpeedInHz(
-      map(abs(joy), 0, 512, JOG_MIN_SPEED, FAST_SPEED));
-    long delta = joy > 0 ? JOG_CHUNK : -JOG_CHUNK;
-    if (withinLimits(stepper->getCurrentPosition() + delta)) {
-      moveStartPos = stepper->getCurrentPosition();
-      moveTargetPos = moveStartPos + delta;
-      stepper->move(delta);
-      mode = JOGGING;
+  // Joystick jog (disabled while store-armed)
+  if (!storeArmed) handleJoystick();
+
+  // If we’re moving to a preset, detect arrival and go idle + save position.
+  if (mode == Mode::MOVE_TO_PRESET) {
+    if (!stepper->isRunning()) {
+      persist.lastPositionSteps = clampPos(stepper->getCurrentPosition());
+      persist.hasValidPosition = 1;
+      savePersist();
+      currentPresetIndex = 255;
+      enterMode(Mode::IDLING);
     }
   }
 
-  if (mode == JOGGING && abs(joy) <= JOG_DEADBAND) {
-    stepper->stopMove();
-    DBG_I("---Jog stopped---");
-    mode = IDLE;
+  // If jogging and motion stopped (e.g., hit clamp target), go idle
+  if (mode == Mode::JOG) {
+    if (!stepper->isRunning()) {
+      enterMode(Mode::IDLING);
+    }
   }
 
-  if (mode == MOVING && !stepper->isRunning()) {
-    DBG_I("---Move complete---");
-    long pos = stepper->getCurrentPosition();
-    EEPROM.put(EE_LASTPOS, pos);
-    moveStartPos = pos;
-    moveTargetPos = pos;
-    activePreset = -1;
-    mode = IDLE;
-  }
-
-  updateDisplay();
+  persistPositionIfIdle();
+  updateOLED();
 }
