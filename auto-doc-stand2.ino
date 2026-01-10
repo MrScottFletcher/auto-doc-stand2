@@ -69,6 +69,9 @@ TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 #define JOG_DEADBAND   50
 #define JOG_MIN_SPEED  2000UL
 
+//The MAX pos value for the length of screw travel - to limit the hunting around.
+#define MAX_POS        327173UL
+
 /* ===================== TMC CURRENT ===================== */
 #define RUN_IRUN   31
 #define HOME_IRUN  18
@@ -103,17 +106,18 @@ long moveStartPos = 0;
 long moveTargetPos = 0;
 
 /* ===================== STALLGUARD ===================== */
-#define HOME_FAST_SPEED 60000UL //30000UL
-#define HOME_FAST_ACCEL 20000UL //20000UL
+//driver.TCOOLTHRS(500);
+#define HOME_FAST_TCOOLTHRS 500UL //500UL
+#define HOME_FAST_SPEED 30000UL //30000UL
+#define HOME_FAST_ACCEL 60000UL //20000UL
 
-#define HOME_SLOW_SPEED 10000UL //10000UL
-#define HOME_SLOW_ACCEL 6000UL  //3000UL
+//driver.TCOOLTHRS(2500);
+#define HOME_SLOW_TCOOLTHRS 2500UL //2500UL
+#define HOME_SLOW_SPEED 6000UL //10000UL
+#define HOME_SLOW_ACCEL 3000UL  //3000UL
 
 #define HOME_BACKOFF    5000L
 
-uint16_t sgFreeAvg = 0;
-uint16_t sgStallMin = 1023;
-uint16_t sgDerivedThrs = 100;
 uint8_t homingConfidence = 0;
 bool sgCalibrated = false;
 
@@ -125,7 +129,8 @@ unsigned long calSummaryStart = 0;
 #define CAL_SUMMARY_TIME 4000
 
 /* ===================== SOFTWARE STALL DETECTOR ===================== */
-#define SG_SAMPLE_MS     8
+#define SG_TRIGGER_VALUE 2
+#define SG_SAMPLE_MS     16
 #define SG_HITS_REQUIRED 6
 
 uint8_t sgHits = 0;
@@ -133,8 +138,9 @@ unsigned long lastSGSample = 0;
 
 bool isStallCondition(uint16_t sg) {
   // Normal TMC2209 behavior: SG_RESULT drops toward 0 at stall
-  DBG_I("sgDerivedThrs = " + String(sgDerivedThrs) + "  current: " + String(sg));
-  return (sg <= sgDerivedThrs);
+  long pos = stepper->getCurrentPosition();
+  DBG_I("current pos: " + String(pos) + " ---- current SG: " + String(sg));
+  return (sg <= SG_TRIGGER_VALUE);
 }
 
 bool softwareStallDetected() {
@@ -177,20 +183,15 @@ void rehomeISR() { rehomeTriggered = true; }
 /* ===================== EEPROM CAL ===================== */
 bool loadSGCalibration() {
   if (EEPROM.read(EE_SG_VALID) != 0xA5) return false;
-  EEPROM.get(EE_SG_FREEAVG, sgFreeAvg);
-  EEPROM.get(EE_SG_STALLMIN, sgStallMin);
-  EEPROM.get(EE_SG_THR, sgDerivedThrs);
   homingConfidence = EEPROM.read(EE_SG_CONF);
-  driver.SGTHRS(sgDerivedThrs);
+  driver.SGTHRS(SG_TRIGGER_VALUE);
   sgCalibrated = true;
   return true;
 }
 
 void saveSGCalibration() {
   EEPROM.write(EE_SG_VALID, 0xA5);
-  EEPROM.put(EE_SG_FREEAVG, sgFreeAvg);
-  EEPROM.put(EE_SG_STALLMIN, sgStallMin);
-  EEPROM.put(EE_SG_THR, sgDerivedThrs);
+  EEPROM.put(EE_SG_STALLMIN, SG_TRIGGER_VALUE);
   EEPROM.write(EE_SG_CONF, homingConfidence);
 }
 
@@ -203,7 +204,8 @@ void homeAxis() {
   bool bottomSet = false;
   uint32_t sgSum = 0;
   uint16_t sgCount = 0;
-  
+
+  //======================================
   // Phase 1: Fast seek
   stepper->setSpeedInHz(HOME_FAST_SPEED);
   stepper->setAcceleration(HOME_FAST_ACCEL);
@@ -211,7 +213,7 @@ void homeAxis() {
   delay(15);
   driver.TCOOLTHRS(0);
   delay(15);
-
+  //====================================== 
   DBG_I("COARSE Move to bottom STARTED.");
   stepper->moveTo(-200000);
     while (stepper->isRunning()) {
@@ -221,7 +223,6 @@ void homeAxis() {
 
     sgSum += sg;
     sgCount++;
-    if (sg < sgStallMin) sgStallMin = sg;
 
     if (softwareStallDetected()) {
       DBG_I("SOFTWARE STALL DETECTED (BOTTOM)");
@@ -237,7 +238,6 @@ void homeAxis() {
     delay(1000);
     stepper->move(HOME_BACKOFF);
     delay(1000);
-
   }
   
   // Phase 2: Slow StallGuard refine
@@ -251,25 +251,22 @@ void homeAxis() {
   driver.TCOOLTHRS(0xFFFFF);
   delay(15);
 
-  sgStallMin = 1023;
   resetSoftwareStall();
 
   DBG_I("FINE Move to bottom with StallGuard.");
-  stepper->moveTo(-40000);
+  stepper->moveTo(-400000);
   while (stepper->isRunning()) {
     uint16_t sg = driver.SG_RESULT();
     lastSG = sg;
 
-    sgSum += sg;
     sgCount++;
-    if (sg < sgStallMin) sgStallMin = sg;
 
     if (softwareStallDetected()) {
       DBG_I("SOFTWARE STALL DETECTED (BOTTOM)");
       break;
     }
   }
-
+  //======================================
   stepper->stopMove();
   while (stepper->isRunning());
   
@@ -282,42 +279,36 @@ void homeAxis() {
   while (stepper->isRunning());
   delay(1000);
 
+  driver.SGTHRS(SG_TRIGGER_VALUE);
   // Auto-calibrate
   if (!sgCalibrated && sgCount > 40) {
-    sgFreeAvg = sgSum / sgCount;
-    sgDerivedThrs = constrain((sgFreeAvg + sgStallMin) / 2, 20, 200);
-    driver.SGTHRS(sgDerivedThrs);
-    delay(15);
-    homingConfidence = constrain(
-      map(sgFreeAvg - sgStallMin, 50, 500, 40, 100), 0, 100);
-    sgCalibrated = true;
+    homingConfidence = 100;
     saveSGCalibration();
     showCalSummary = true;
     calSummaryStart = millis();
   }
 
-  // Find max
-  DBG_I("FINE Move to top with StallGuard.");
 
-  //*********************
-  //Just for now - add 50 to stall guard value
-  //cuz going up is harder.  Need to reverse the test to go up first
-  if(sgDerivedThrs > 51){
-    sgDerivedThrs = sgDerivedThrs - 50;
-    driver.SGTHRS(sgDerivedThrs);
-  }
-//*********************
+  //======================================
+  // Phase 2: Fast seek to the top
+  stepper->setSpeedInHz(HOME_FAST_SPEED);
+  stepper->setAcceleration(HOME_FAST_ACCEL);
+  driver.irun(RUN_IRUN);
+  delay(15);
+  driver.TCOOLTHRS(0);
+  delay(15);
+  //======================================
+  // Find max
+  DBG_I("Coarse Move to top with StallGuard.");
 
   delay(50);
   resetSoftwareStall();
   delay(50);
   
-  stepper->moveTo(400000);
+  stepper->moveTo(MAX_POS);
   while (stepper->isRunning()) {
-
     uint16_t sg = driver.SG_RESULT();
     lastSG = sg;
-
     if (softwareStallDetected()) {
       DBG_I("SOFTWARE STALL DETECTED (TOP)");
       break;
@@ -347,8 +338,8 @@ void homeAxis() {
 void drawSGBar(int y) {
   int w = map(lastSG, 0, 1023, 0, 120);
   const char* zone =
-    lastSG > sgDerivedThrs + 150 ? "SAFE" :
-    lastSG > sgDerivedThrs + 40  ? "WARN" : "STALL";
+    lastSG > SG_TRIGGER_VALUE + 150 ? "SAFE" :
+    lastSG > SG_TRIGGER_VALUE + 40  ? "WARN" : "STALL";
 
   display.setCursor(0, y);
   display.print("SG ");
@@ -370,9 +361,6 @@ void updateDisplay() {
   if (showCalSummary && millis() - calSummaryStart < CAL_SUMMARY_TIME) {
     display.setCursor(0, 0);
     display.println("CALIBRATION OK");
-    display.print("SG avg: "); display.println(sgFreeAvg);
-    display.print("SG min: "); display.println(sgStallMin);
-    display.print("SGTHRS: "); display.print(sgDerivedThrs);
     display.print("POS: "); display.println(pos);
     display.print("Conf: "); display.print(homingConfidence); display.print("%");
     display.display();
