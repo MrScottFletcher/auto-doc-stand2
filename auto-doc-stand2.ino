@@ -68,7 +68,7 @@ static void dbgPrintf(const char* fmt, ...) {
 #define REHOME_PIN   3     // INT1
 
 #define STORE_PIN    4
-static const uint8_t PRESET_PINS[5] = {31, 33, 35, 37, 39};
+static const uint8_t PRESET_PINS[5] = {22, 24, 26, 28, 30};
 
 /* ===================== OLED ===================== */
 #define OLED_ADDR    0x3C
