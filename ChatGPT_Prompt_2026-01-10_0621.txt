@@ -1,0 +1,45 @@
+I am a software developer familiar with C#, but I also do some Arduino work. I have built a motorized photo stand to take pictures of photos, newspaper articles, and such. The stand has a NEMA 17 stepper motor on a screw drive, and two limit switches. The screw drive supports a camera mount for my Canon digital SLR camera. I have tried to write code for this in the past, but want to start fresh.  Please help me write controller software for an Arduino AT MEGA 2560 R3 to control the stepper motor that supports the following features: 
+
+- Uses FastAccelStepper library, and a BIG TREE TECH TMC2209 v1.3 on Serial3 with address 0b0 and the following PIN assignments:
+#define STEP_PIN     7
+#define DIR_PIN      48
+#define ENABLE_PIN   44
+
+- Uses UART on Serial3 to communicate with the TMC2209
+
+- Has a method to query and putput all of the stepper driver parameters to the Debug output
+
+- A joystick on Pin A0 to manually position the camera carriage up and down 
+
+- A configurable JOG_DEADBAND for the joystick
+
+- Self homing on initial startup to find the min bottom position using a limit switch attached to PIN 19
+-- We will NOT use StallGuard for autohoming on the TCM2209.  We will use the limit switch for the bottom, and we will manually configure the maximum travel position.
+
+- Memory to store the last position so that it does not need to re-home every time it powers on.
+
+- A button to manually initiate the rehoming again attached to PIN 3
+
+- Speed ramping to ease in and out the carriage movements. 
+
+- Position memory presets to store 5 positions, with a position “store” button on PIN 4, and with each stored memory position having its own dedicated button. 
+The position buttons shall be connected to pins 31, 33, 35, 37, 39
+When pressed, each memory position button should interrupt the current travel of the carriage, but should do it gently by ramping down the travel speed to avoid jarring and sudden changes in velocity and direction. 
+
+- An emergency stop button connected to PIN 2 as an Interrupt to stop the travel of the carriage at anytime, especially while it it Travelling to a stored memory position. 
+
+- Support for status display on a small OLED displays of type GeekPi OLED Display Module IIC 128x64 Pixel .96 Inch Display Module Yellow Blue Two-Color Display.  The status display should:
+-- show startup initialization status messages.
+-- show the current operation mode - (i.e travel to preset, jog speed, idle, 
+-- show a progress bar while the carriage moves from its current position to a stored target position.
+-- show the current present number.
+-- show the current position.
+-- show that the Store button has been pressed and is waiting for the user to press a preset button to store the position to the preset.
+
+- On startup, the display and the Debug output should show any errors, like if the UART cannot read the driver version 
+
+- Also, I want the Stepper motor to move very quickly at its maximum speed, so consider using an external stepper motor controller to maximize its speed.
+
+- A Debug compiler flag and Debug output method to output information to Seria1
+
+- The Serial and Serial3 speeds should be 115200
