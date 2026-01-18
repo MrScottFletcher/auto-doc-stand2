@@ -180,8 +180,8 @@ static bool isPressed(uint8_t pin) {
 
 static int32_t clampPos(int32_t p) {
   if (p < 0) return 0;
-  //TEMP Just for initial testing - uncomment this when you figure out the Max Pos
-  //if (p > MAX_TRAVEL_STEPS) return MAX_TRAVEL_STEPS;
+  //During manual calibration - uncomment this when you figure out the Max Pos
+  if (p > MAX_TRAVEL_STEPS) return MAX_TRAVEL_STEPS;
   return p;
 }
 
